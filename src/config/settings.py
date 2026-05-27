@@ -13,6 +13,16 @@ Cơ sở lý thuyết phần mềm (Software Engineering & MLOps):
    AI thích ứng (Adaptive AI).
 """
 
+# --- MODEL CONFIGURATION ---
+# Chọn loại model muốn sử dụng: "svm", "rf" hoặc "xgboost"
+MODEL_TYPE = "xgboost"  
+
+MODEL_PATHS = {
+    "rf":      os.path.join(os.path.dirname(__file__), '..', 'models', 'rf_model.pkl'),
+    "svm":     os.path.join(os.path.dirname(__file__), '..', 'models', 'svm_model.pkl'),
+    "xgboost": os.path.join(os.path.dirname(__file__), '..', 'models', 'xgboost_model.pkl'),
+}
+
 # --- EAR & MAR THRESHOLDS ---
 # Các giá trị này có thể tinh chỉnh sau quá trình Tuning Threshold trên tập UTA-RLDD
 EAR_THRESHOLD = 0.22      # Ngưỡng nhắm mắt (dưới giá trị này là nhắm mắt)
@@ -20,7 +30,7 @@ MAR_THRESHOLD = 0.55       # Ngưỡng ngáp (trên giá trị này là ngáp)
 
 # --- HEAD POSE THRESHOLDS (Distraction) ---
 # Cảnh báo khi Yaw (quay trái/phải) hoặc Pitch (cúi/ngẩng) vượt ngưỡng
-PITCH_THRESHOLD = 15.0    # Độ
+PITCH_THRESHOLD = 20.0    # Độ
 YAW_THRESHOLD = 20.0      # Độ
 
 # --- TIME PARAMETERS ---

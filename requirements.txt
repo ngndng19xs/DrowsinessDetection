@@ -19,3 +19,4 @@ moviepy>=2.2.1              # Sử dụng cho công cụ Data_Extraction để c
 imageio-ffmpeg>=0.6.0       # Tích hợp nhân FFmpeg dùng cho thao tác "Stream Copy" siêu tốc (Ghép 4000 video 5s thành 15s chỉ trong vài chục giây mà không cần Render lại).
 tqdm>=4.66.4                # Thư viện hiển thị thanh tiến trình (Progress Bar) trực quan trên Terminal khi chạy các script phân tích hàng loạt video.
 python-dotenv>=1.0.1        # Quản lý các biến môi trường nếu sau này muốn mở rộng kết nối Cloud/API.
+scikit-learn>=1.3.0         # Hỗ trợ huấn luyện mô hình Random Forest.

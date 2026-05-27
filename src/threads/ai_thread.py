@@ -4,6 +4,9 @@ import cv2
 import mediapipe as mp
 import sys
 import os
+import collections
+import numpy as np
+import pickle
 
 # Đảm bảo đường dẫn import tương đối
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -15,25 +18,13 @@ from src.utils.preprocessing import preprocess_frame
 class AIThread(threading.Thread):
     """
     Luồng AI đảm nhận tính toán nặng nhất của hệ thống: Phát hiện khuôn mặt và đánh giá chỉ số sinh trắc.
-    
-    YÊU CẦU LÝ THUYẾT HỌC THUẬT:
-    --------------------------
-    Kiến trúc AI: Tại sao chọn MediaPipe FaceMesh (kiến trúc One-Stage) thay vì Two-Stage?
-    - Trong các mạng Two-Stage (như Faster R-CNN), quá trình xử lý phụ thuộc nhiều vào module 
-      Region Proposal Network (hoặc Selective Search) để lọc ra các vùng ứng viên, sau đó mới 
-      dùng RoI Pooling để trích xuất đặc trưng. Mặc dù cho độ chính xác cao nhưng luồng xử lý 
-      hai giai đoạn này quá tốn kém và hoàn toàn không phù hợp với yêu cầu Real-time của DMS.
-    - Ngược lại, MediaPipe dựa trên BlazeFace (kiến trúc One-Stage siêu nhẹ). Thuật toán này 
-      hoạt động như một bộ dò tìm một chặng (single-shot detector), kết hợp dự đoán Bounding Box 
-      và 468 Landmarks trực tiếp trên toàn bộ vùng ảnh mà không cần qua bước trung gian tạo Region 
-      Proposals. Sự tinh giản này giúp hệ thống đạt FPS rất cao ngay cả trên CPU, lý tưởng 
-      cho luồng AI phân tích thời gian thực trong ô tô.
+    Sử dụng Sliding Temporal Window 4x15 kết hợp Random Forest Classifier.
     """
-    def __init__(self, frame_queue, result_queue, state_queue, stop_event):
+    def __init__(self, frame_queue, result_queue, shared_state, stop_event):
         super().__init__()
         self.frame_queue = frame_queue
         self.result_queue = result_queue
-        self.state_queue = state_queue
+        self.shared_state = shared_state
         self.stop_event = stop_event
         
         # Khởi tạo MediaPipe FaceMesh
@@ -45,116 +36,121 @@ class AIThread(threading.Thread):
             min_tracking_confidence=0.5
         )
         
-        # Cơ chế Sliding Counter (Bộ đếm trượt)
-        self.drowsy_counter = 0
-        self.yawn_counter = 0
-        self.distracted_counter = 0
+        # Cơ chế Sliding Temporal Window (15 frames cho 4 đặc trưng)
+        # Sẽ lưu dạng tuple (ear, mar, pitch, yaw)
+        self.sliding_window = collections.deque(maxlen=15)
         
-        # Số frame vượt ngưỡng liên tiếp để đưa ra quyết định (Tuning parameters)
-        self.DROWSY_FRAMES_TH = 15
-        self.YAWN_FRAMES_TH = 10
-        self.DISTRACTED_FRAMES_TH = 15
+        # Số lần liên tiếp dự đoán Drowsy
+        self.consecutive_drowsy = 0
+        self.DROWSY_CONSECUTIVE_TH = 15
+        
+        # Tải mô hình Random Forest
+        self.model = None
+        model_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'rf_model.pkl')
+        if os.path.exists(model_path):
+            with open(model_path, 'rb') as f:
+                self.model = pickle.load(f)
+            print("[INFO] Đã tải mô hình Random Forest thành công.")
+        else:
+            print("[WARNING] Không tìm thấy mô hình rf_model.pkl. Sẽ dùng Logic Ngưỡng Tạm Thời!")
 
     def run(self):
         while not self.stop_event.is_set():
-            # 1. Lấy frame từ queue (non-blocking để kiểm tra stop_event)
+            # 1. Lấy frame từ queue
             try:
                 frame = self.frame_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
                 
-            # Lưu lại bản copy để hiển thị (chưa bị vẽ đè bởi MediaPipe trong luồng này)
             display_frame = frame.copy()
             h, w, _ = frame.shape
             
-            # 2. Tiền xử lý (Xử lý thiếu sáng bằng CLAHE và chuyển sang RGB bắt buộc)
+            # 2. Tiền xử lý
             rgb_frame, _ = preprocess_frame(frame)
             
-            # 3. Chạy MediaPipe FaceMesh
+            # 3. Chạy MediaPipe
             results = self.face_mesh.process(rgb_frame)
             
             state = "Normal"
-            ear, mar, pitch, yaw, roll = 0.0, 0.0, 0.0, 0.0, 0.0
+            ear, mar, pitch, yaw = 0.0, 0.0, 0.0, 0.0
             
             if results.multi_face_landmarks:
                 landmarks = results.multi_face_landmarks[0].landmark
                 
-                # Trích xuất Landmarks cho EAR (2 mắt x 6 điểm)
+                # EAR
                 left_eye_indices = [362, 385, 387, 263, 373, 380]
                 right_eye_indices = [33, 160, 158, 133, 153, 144]
+                ear = (calculate_ear([landmarks[i] for i in left_eye_indices], w, h) + 
+                       calculate_ear([landmarks[i] for i in right_eye_indices], w, h)) / 2.0
                 
-                left_eye = [landmarks[i] for i in left_eye_indices]
-                right_eye = [landmarks[i] for i in right_eye_indices]
-                
-                ear = (calculate_ear(left_eye, w, h) + calculate_ear(right_eye, w, h)) / 2.0
-                
-                # Trích xuất Landmarks cho MAR (8 điểm miệng)
+                # MAR
                 mouth_indices = [61, 81, 13, 311, 291, 402, 14, 178]
-                mouth = [landmarks[i] for i in mouth_indices]
-                mar = calculate_mar(mouth, w, h)
+                mar = calculate_mar([landmarks[i] for i in mouth_indices], w, h)
                 
-                # Trích xuất góc Head Pose
-                pitch, yaw, roll = get_head_pose(landmarks, w, h)
+                # Pose
+                pitch, yaw, _ = get_head_pose(landmarks, w, h)
                 
-                # 4. Cơ chế Sliding Counter
-                # --- Nhắm mắt (Drowsy) ---
-                if ear < EAR_THRESHOLD:
-                    self.drowsy_counter += 1
-                else:
-                    self.drowsy_counter = 0 # Reset về 0 nếu bình thường
+                # Đẩy vào cửa sổ trượt (Sliding Window)
+                self.sliding_window.append((ear, mar, pitch, yaw))
                 
-                # --- Ngáp (Yawning - Drowsy) ---
-                if mar > MAR_THRESHOLD:
-                    self.yawn_counter += 1
-                else:
-                    self.yawn_counter = 0
+                # Đợi đủ 15 frames để bắt đầu phân loại
+                if len(self.sliding_window) == 15:
+                    if self.model is not None:
+                        # Rút trích theo đúng thứ tự lúc train: [ear_15, mar_15, pitch_15, yaw_15]
+                        ears = [item[0] for item in self.sliding_window]
+                        mars = [item[1] for item in self.sliding_window]
+                        pitches = [item[2] for item in self.sliding_window]
+                        yaws = [item[3] for item in self.sliding_window]
+                        
+                        features = np.concatenate([ears, mars, pitches, yaws]).reshape(1, -1)
+                        pred = self.model.predict(features)[0]
+                        # 0: Normal, 1: Drowsy, 2: Distracted
+                        if pred == 1:
+                            raw_state = "Drowsy"
+                        elif pred == 2:
+                            raw_state = "Distracted"
+                        else:
+                            raw_state = "Normal"
+                    else:
+                        # Fallback threshold logic
+                        if ear < EAR_THRESHOLD or mar > MAR_THRESHOLD:
+                            raw_state = "Drowsy"
+                        elif abs(yaw) > YAW_THRESHOLD or abs(pitch) > PITCH_THRESHOLD:
+                            raw_state = "Distracted"
+                        else:
+                            raw_state = "Normal"
                     
-                # --- Nhìn lệch (Distracted) ---
-                if abs(yaw) > YAW_THRESHOLD or abs(pitch) > PITCH_THRESHOLD:
-                    self.distracted_counter += 1
-                else:
-                    self.distracted_counter = 0
-                
-                # 5. Phân tích kết quả logic
-                if self.drowsy_counter >= self.DROWSY_FRAMES_TH or self.yawn_counter >= self.YAWN_FRAMES_TH:
-                    state = "Drowsy"
-                elif self.distracted_counter >= self.DISTRACTED_FRAMES_TH:
-                    state = "Distracted"
-                else:
-                    state = "Normal"
+                    # Logic bộ lọc chống nhiễu (Consecutive Counter)
+                    if raw_state == "Drowsy":
+                        self.consecutive_drowsy += 1
+                        if self.consecutive_drowsy >= self.DROWSY_CONSECUTIVE_TH:
+                            state = "Drowsy"
+                    elif raw_state == "Distracted":
+                        state = "Distracted"
+                        self.consecutive_drowsy = 0
+                    else:
+                        state = "Normal"
+                        self.consecutive_drowsy = 0
             
-            # Gửi tín hiệu sang Alert Thread (Drop old, keep new)
-            try:
-                self.state_queue.put_nowait(state)
-            except queue.Full:
-                try:
-                    self.state_queue.get_nowait()
-                    self.state_queue.put_nowait(state)
-                except queue.Empty:
-                    pass
+            # Cập nhật vào Shared State
+            self.shared_state.update(
+                status=state.upper(),
+                ear=ear,
+                mar=mar,
+                pitch=pitch,
+                yaw=yaw,
+                landmarks=results.multi_face_landmarks[0] if results.multi_face_landmarks else None
+            )
             
-            # Đóng gói dữ liệu hiển thị cho UI
-            result_data = {
-                "frame": display_frame,
-                "landmarks": results.multi_face_landmarks[0] if results.multi_face_landmarks else None,
-                "ear": ear,
-                "mar": mar,
-                "pitch": pitch,
-                "yaw": yaw,
-                "state": state
-            }
-            
-            # Đẩy vào result_queue (Drop old, keep new)
+            # Đẩy frame vào result_queue để UI Thread render
             if self.result_queue.full():
                 try:
                     self.result_queue.get_nowait()
                 except queue.Empty:
                     pass
-            
             try:
-                self.result_queue.put_nowait(result_data)
+                self.result_queue.put_nowait(display_frame)
             except queue.Full:
                 pass
                 
-        # Dọn dẹp MediaPipe khi dừng luồng
         self.face_mesh.close()
