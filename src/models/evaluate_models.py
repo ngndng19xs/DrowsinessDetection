@@ -4,10 +4,14 @@ MODULE: ĐÁNH GIÁ & SO SÁNH CÁC MÔ HÌNH MACHINE LEARNING
 
 Mục đích:
     - Tải các mô hình đã huấn luyện (RF, SVM, XGBoost) từ file .pkl
+    - Đọc dữ liệu TEST THỰC TẾ từ data/test_features.csv
+      (được tạo bởi extract_features_from_videos.py)
     - Tính toán các chỉ số đánh giá: Accuracy, Precision, Recall, F1-Score
     - Đo Latency: thời gian dự đoán trung bình trên 1 frame (sample)
     - Trực quan hóa kết quả bằng biểu đồ matplotlib
 
+Cách chạy:
+    python src/models/evaluate_models.py
 """
 
 import os
@@ -16,6 +20,7 @@ import time
 import pickle
 import warnings
 import numpy as np
+import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -29,7 +34,6 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report,
 )
-from sklearn.model_selection import train_test_split
 
 # Cấu hình output encoding (Windows)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -43,6 +47,7 @@ matplotlib.rcParams["font.family"] = "DejaVu Sans"
 
 # Đường dẫn
 MODELS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR   = os.path.abspath(os.path.join(MODELS_DIR, "..", ".."))
 OUTPUT_DIR = os.path.join(MODELS_DIR, "evaluation_results")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -52,9 +57,11 @@ MODEL_FILES = {
     "XGBoost":       os.path.join(MODELS_DIR, "xgboost_model.pkl"),
 }
 
-CLASS_NAMES  = ["Normal", "Drowsy", "Distracted"]
-N_LATENCY    = 500   # Số frame dùng để đo latency
-N_TEST_SAMPLES = 400 # Số mẫu tập test
+# File CSV dữ liệu test thực tế
+TEST_CSV = os.path.join(ROOT_DIR, "data", "test_features.csv")
+
+CLASS_NAMES = ["Normal", "Drowsy", "Distracted"]
+N_LATENCY   = 500   # Số frame dùng để đo latency
 
 # Màu sắc
 PALETTE = {
@@ -70,48 +77,35 @@ GRID_COLOR = "#2A2D3A"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  1. SINH DỮ LIỆU TEST (giống hệt logic trong các file train_*.py)
+#  1. ĐỌC DỮ LIỆU TEST THỰC TẾ
 # ══════════════════════════════════════════════════════════════════════════════
-def generate_dummy_data(n_samples: int = 2000, random_state: int = 99) -> tuple:
+def load_test_data(csv_path: str = TEST_CSV) -> tuple:
     """
-    Sinh dữ liệu giả lập 60-feature (EAR, MAR, Pitch, Yaw) × 15 frames.
-    Dùng random_state riêng để tạo tập test độc lập với tập train.
+    Đọc dữ liệu test THỰC TẾ từ file CSV được tạo bởi extract_features_from_videos.py.
+
+    CSV format: EAR_f0..EAR_f14 | MAR_f0..MAR_f14 | Pitch_f0..Pitch_f14 | Yaw_f0..Yaw_f14 | label
+
+    Trả về:
+        (X_test, y_test) dạng numpy array
     """
-    rng = np.random.RandomState(random_state)
-    X = np.zeros((n_samples, 60))
-    y = np.zeros(n_samples, dtype=int)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Khong tim thay file CSV test: {csv_path}\n"
+            "Hay chay truoc: python src/models/extract_features_from_videos.py"
+        )
 
-    for i in range(n_samples):
-        label = rng.choice([0, 1, 2])
-        y[i] = label
+    df = pd.read_csv(csv_path)
+    X  = df.drop(columns=["label"]).values.astype(np.float32)
+    y  = df["label"].values.astype(int)
 
-        if label == 0:  # Normal
-            ear   = rng.uniform(0.26, 0.35, 15)
-            mar   = rng.uniform(0.10, 0.25, 15)
-            pitch = rng.uniform(-10,  10,  15)
-            yaw   = rng.uniform(-15,  15,  15)
+    print(f"  >> Doc test CSV: {csv_path}")
+    print(f"  >> Kich thuoc : {X.shape[0]} mau x {X.shape[1]} features")
 
-        elif label == 1:  # Drowsy
-            if rng.choice([True, False]):
-                ear = rng.uniform(0.25, 0.35, 15)
-                mar = rng.uniform(0.40, 0.80, 15)
-            else:
-                ear = rng.uniform(0.10, 0.18, 15)
-                mar = rng.uniform(0.10, 0.25, 15)
-            pitch = rng.uniform(-10, 25, 15)
-            yaw   = rng.uniform(-15, 15, 15)
-
-        else:  # Distracted
-            ear = rng.uniform(0.26, 0.35, 15)
-            mar = rng.uniform(0.10, 0.25, 15)
-            if rng.rand() > 0.5:
-                pitch = rng.uniform( 25,  40, 15)
-                yaw   = rng.uniform( 35,  60, 15)
-            else:
-                pitch = rng.uniform(-40, -25, 15)
-                yaw   = rng.uniform(-60, -35, 15)
-
-        X[i] = np.concatenate([ear, mar, pitch, yaw])
+    # In phân phối nhãn
+    unique, counts = np.unique(y, return_counts=True)
+    for lbl, cnt in zip(unique, counts):
+        label_name = CLASS_NAMES[lbl] if lbl < len(CLASS_NAMES) else f"Label_{lbl}"
+        print(f"     Lop {lbl} ({label_name}): {cnt} mau")
 
     return X, y
 
@@ -560,16 +554,13 @@ def main() -> None:
     sep = "=" * 62
     print(f"\n{sep}")
     print("  DANH GIA MO HINH - DROWSINESS DETECTION")
+    print("  (Du lieu test THUC TE tu data/test_features.csv)")
     print(sep)
 
-    # 1. Sinh dữ liệu test
-    print("\n[1/4] Sinh du lieu test doc lap (random_state=99)...")
-    X_all, y_all = generate_dummy_data(n_samples=N_TEST_SAMPLES * 3, random_state=99)
-    _, X_test, _, y_test = train_test_split(
-        X_all, y_all, test_size=N_TEST_SAMPLES / (N_TEST_SAMPLES * 3),
-        random_state=42, stratify=y_all
-    )
-    X_latency = X_test[:N_LATENCY]
+    # 1. Đọc dữ liệu test thực tế
+    print("\n[1/4] Doc du lieu test thuc te tu CSV...")
+    X_test, y_test = load_test_data(TEST_CSV)
+    X_latency = X_test[:min(N_LATENCY, len(X_test))]
     print(f"  Test set: {len(X_test)} mau | Latency set: {len(X_latency)} mau")
 
     # 2. Tải mô hình
@@ -578,9 +569,10 @@ def main() -> None:
 
     if not models:
         print("\n[LOI] Khong tim thay bat ky mo hinh nao. Hay chay cac script train truoc!")
-        print("  python src/models/train_dummy_model_rf.py")
-        print("  python src/models/train_dummy_model_svm.py")
-        print("  python src/models/train_dummy_model_xgboost.py")
+        print("  python src/models/extract_features_from_videos.py")
+        print("  python src/models/train_rf.py")
+        print("  python src/models/train_svm.py")
+        print("  python src/models/train_xgboost.py")
         return
 
     # 3. Tính metrics & latency cho từng model

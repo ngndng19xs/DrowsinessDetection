@@ -15,7 +15,7 @@ Cơ sở lý thuyết phần mềm (Software Engineering & MLOps):
 
 # --- MODEL CONFIGURATION ---
 # Chọn loại model muốn sử dụng: "svm", "rf" hoặc "xgboost"
-MODEL_TYPE = "xgboost"  
+MODEL_TYPE = "rf"  
 
 MODEL_PATHS = {
     "rf":      os.path.join(os.path.dirname(__file__), '..', 'models', 'rf_model.pkl'),
